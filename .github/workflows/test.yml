@@ -1,4 +1,10 @@
-on: [push]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated Go test names to run instead of the full integration suite'
+        required: false
+        default: ''
 name: Test
 jobs:
   test:
@@ -7,8 +13,19 @@ jobs:
         # This is just a version to compile the integration_test.go; see
         # golangVersions in that file for the list of actual Go versions used.
         go-version: [1.x]
-        os: [ubuntu-latest] # TODO: Add [macos-latest, windows-latest]
+        # ubuntu-22.04 is what ubuntu-latest resolved to at the v1.30.0 release
+        # date; the current ubuntu-latest image ships a gcc too new to build the
+        # protobuf 22.0 / abseil toolchain that integration_test.go compiles.
+        os: [ubuntu-22.04] # TODO: Add [macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    env:
+      # integration_test.go builds protobuf 22.0 with `bazel`, which on the
+      # runner is bazelisk. protobuf 22.0 has no .bazelversion, so bazelisk
+      # picks the latest Bazel release, which is bzlmod-only and has dropped
+      # the WORKSPACE support that protobuf 22.0 needs. Pin the release-era
+      # Bazel 6.1.0 (2023-03-08), which still defaults to --enable_bzlmod=false.
+      USE_BAZEL_VERSION: 6.1.0
     steps:
     - name: Install Linux dependencies
       if: runner.os == 'Linux'
@@ -19,10 +36,57 @@ jobs:
         go-version: ${{ matrix.go-version }}
     - name: Checkout code
       uses: actions/checkout@v3
+    # Build the module source zip from the pristine checkout, before the cache
+    # restore or the test run can drop byproducts into the tree. The helper
+    # module lives in RUNNER_TEMP so it never enters the zip or the work tree.
+    - name: Build module zip
+      run: |
+        set -eux
+        mkdir -p "$RUNNER_TEMP/zipper" "$RUNNER_TEMP/build_output"
+        cat > "$RUNNER_TEMP/zipper/create_mod.go" <<'EOF'
+        package main
+        import (
+          "log"
+          "os"
+          "golang.org/x/mod/module"
+          "golang.org/x/mod/zip"
+        )
+        func main() {
+          if len(os.Args) != 5 {
+            log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+          }
+          m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          f, err := os.Create(os.Args[4])
+          if err != nil {
+            log.Fatal(err)
+          }
+          defer f.Close()
+          if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+            log.Fatal(err)
+          }
+          log.Printf("created module zip: %s", os.Args[4])
+        }
+        EOF
+        cd "$RUNNER_TEMP/zipper"
+        go mod init sealzipper
+        go get golang.org/x/mod@v0.9.0
+        go run create_mod.go google.golang.org/protobuf v1.30.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/build_output/v1.30.0.zip"
+        unzip -l "$RUNNER_TEMP/build_output/v1.30.0.zip" | head -20
+    - name: Upload module zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: module-zip
+        path: ${{ runner.temp }}/build_output/v1.30.0.zip
+        if-no-files-found: error
     - name: Cache dependencies
-      uses: actions/cache@v3.0.2
+      uses: actions/cache@v4
       with:
         path: .cache
         key: ${{ runner.os }}-${{ hashFiles('integration_test.go') }}
     - name: Test
-      run: go test -v -timeout=60m -count=1 -failfast integration_test.go
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          go test -v -count=1 -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./...
+        else
+          go test -v -timeout=60m -count=1 -failfast integration_test.go
+        fi
